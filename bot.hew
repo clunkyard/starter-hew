@@ -113,6 +113,18 @@ impl Strategy for Starter {
                 }
             }
         }
+        // Only the arena's rate calibration sends this; safe to delete.
+        if let .Some(work) = robot.raw.number("state.calibration.work")? {
+            if work >= 1.0 && work == math.floor(work) { robot.status.set(.Some("WORK"), .Some(calibration_work(work as i64, tick as i64)))?; }
+        }
     }
+}
+// The calibration kernel, xorshift-sqrt v1: work rounds of a 64-bit
+// xorshift and a square-root sum.
+fn calibration_work(work: i64, tick: i64) -> f64 {
+    var x: u64 = 88172645463325252 ^ (tick as u64);
+    var sum = 0.0;
+    for _ in 0..work { x ^= x << 13; x ^= x >> 7; x ^= x << 17; sum += math.sqrt((x >> 11) as f64); }
+    (((math.floor(sum) as u64) + (x >> 40)) % 1000000) as f64
 }
 fn main() { let _ = clunkyard.run(Starter { free_flight: false }); }
