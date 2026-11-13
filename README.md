@@ -14,6 +14,10 @@ npx @clunkyard/cli replay
 
 If you use Make, the equivalent commands are `make doctor`, `make`, `make match` and `make replay`. The CLI downloads the local match engine and your language's SDK. Downloads and build output stay in `.clunkyard/`.
 
+This robot builds to WebAssembly (wasm32-wasip1), as the hosted builder does, and runs on the Wasmtime host metered by fuel, which counts the same on every computer. In Season 3 its fuel tier is 3 (rates/s3.json); a local match uses the same fuel budget as Standard. Install Hew 0.10.0 or later with its wasm32-wasip1 runtime libraries; set HEW_ROOT if hew is not on PATH. Install wasi-sdk 33 and set WASI_SDK_PATH to it, or provide Clang 22 with wasm-ld and set WASI_SYSROOT to a wasi-sdk 33 sysroot.
+
+Set "target": "native" in bot.json to build with hew and your C compiler instead. A native build plays Open only: Standard refuses it. Other platforms build natively until their SDK carries the WebAssembly host.
+
 Install Hew 0.10.0 or later and a C compiler. The SDK builds its Hew binding with your installed toolchain.
 
 The [language guide](https://clunkyard.com/sdk/hew) covers the robot API and your toolchain. Use `doctor` to check your installation.
