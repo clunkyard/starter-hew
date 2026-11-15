@@ -7,7 +7,8 @@
 // clock: tick seconds remaining_ticks
 // arena: size gravity terrain_kind ground_height(x y)
 // me: health position velocity heading pitch roll angular_velocity
-//   attitude grounded altitude applied
+//   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+//   from_mount(heading pitch) mount_toward(point)
 // battery: charge capacity regen sustainable_drive compute
 //   drive_cost(fraction)
 // drive: hover_lift
@@ -29,7 +30,8 @@
 // score: me best armour
 // angles: normalize(degrees) angle_diff(target current)
 //   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-//   distance(a b) clamp(value low high)
+//   distance(a b) to_chassis(heading pitch attitude)
+//   from_chassis(heading pitch attitude) clamp(value low high)
 // raw: number(path) text(path) has(path) flag(path) count(path) line()
 // Controls: drive.set(throttle turn pitch_turn)
 //   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -45,7 +47,8 @@ import hew.clunkyard;
 import hew.clunkyard.{Robot, Strategy, CoreError, Direction};
 import std.math;
 
-type Starter { free_flight: bool; }
+// The tick the dodge ends, and how many dodges so far.
+type Starter { free_flight: bool; dodge_until: i32; dodges: i32; }
 fn steer(robot: Robot, towards: f64, current: f64, scale: f64 = 45.0) -> f64 fails CoreError {
     robot.angles.clamp(robot.angles.angle_diff(towards, current)? / scale)?
 }
@@ -65,6 +68,7 @@ impl Strategy for Starter {
                 robot.drive.set(.Some(throttle), .Some(steer(robot, target.bearing, heading)?), .Some(steer(robot, target.elevation, pitch)?))?;
                 robot.scanner.set(.Some(target.bearing), .Some(20.0), .Some(target.elevation))?;
                 let power = robot.gun.power_for_flight_time(target.range, 1.0)?;
+                // The lead is the intercept if the target holds its course.
                 let aim = match robot.gun.lead(target, power)? {
                     .Some(aim) => Direction { heading: aim.heading, pitch: aim.pitch },
                     .None => Direction { heading: target.bearing, pitch: target.elevation },
@@ -97,6 +101,26 @@ impl Strategy for Starter {
                 }
             }
         }
+        // A simple dodge: vary it, or predict the shooter. A muzzle cue means a
+        // robot fired; for half a second swerve off the line of fire, left and
+        // right in turn.
+        if tick >= self.dodge_until {
+            for cue in robot.sensors.cues()? {
+                if cue.source == clunkyard.SOURCE_MUZZLE { self.dodge_until = tick + 10; self.dodges = self.dodges + 1; break; }
+            }
+        }
+        if tick < self.dodge_until {
+            // Turn is positive left, strafe positive right.
+            let left = self.dodges % 2 == 1;
+            let side = if left { 1.0 } else { -1.0 };
+            if robot.match_info.control()? == clunkyard.CONTROL_FORCES {
+                robot.drive.set(throttle: .Some(0.5))?;
+                robot.drive.forces(strafe: .Some(-side))?;
+            } else {
+                robot.drive.set(.Some(1.0), .Some(side))?;
+            }
+            robot.status.set(.Some(if left { "dodge:left" } else { "dodge:right" }), .Some(self.dodges as f64))?;
+        }
         if robot.battery.charge()? < robot.battery.capacity()? / 4.0 {
             if let .Some(throttle) = robot.drive.get_throttle()? { robot.drive.set(throttle: .Some(throttle * 0.5))?; }
         }
@@ -115,4 +139,4 @@ impl Strategy for Starter {
         }
     }
 }
-fn main() { let _ = clunkyard.run(Starter { free_flight: false }); }
+fn main() { let _ = clunkyard.run(Starter { free_flight: false, dodge_until: 0, dodges: 0 }); }
