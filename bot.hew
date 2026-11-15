@@ -44,11 +44,77 @@
 // axis; pitch is positive up.
 // Manual: https://clunkyard.com/manual#sdk
 import hew.clunkyard;
-import hew.clunkyard.{Robot, Strategy, CoreError, Direction};
+import hew.clunkyard.{Robot, Strategy, CoreError, Direction, Vec3};
 import std.math;
 
-// The tick the dodge ends, and how many dodges so far.
-type Starter { free_flight: bool; dodge_until: i32; dodges: i32; }
+// Bearing is earned: a scan contact's bearing is off by up to its
+// bearing_error (degrees, a fixed share of the arc), so a wide beam finds a
+// robot and a narrow one aims at it. Contacts within 120 units are exact.
+const SEARCH_ARC: f64 = 40.0;  // degrees: sweeps the circle in half a second
+const HOLD_WIDTH: f64 = 60.0;  // units across at the target: it stays in the beam from tick to tick
+const MIN_ARC: f64 = 6.0;      // degrees: the narrowest the beam holds
+const WINDOW: i32 = 12;        // ticks of sightings the aim averages
+const SIGHTINGS: i32 = 8;      // narrow sightings in the window before a shot
+const LOOK_EVERY: i32 = 40;    // ticks between looks around the target, for a nearer robot
+const REACQUIRE: i32 = 10;     // ticks to look again where a lost target was
+
+// The tick the dodge ends, how many dodges so far, and the last target's slot.
+type Starter { free_flight: bool; dodge_until: i32; dodges: i32; slot: i32; }
+// A line through recent sightings: where the robot is now, how fast it moves,
+// and how many sightings it rests on (under 2: no fit).
+type Fit { position: Vec3; velocity: Vec3; count: i32; }
+// A straight line through the narrowest of the last WINDOW ticks' sightings.
+// Each sighting is off by its bearing_error; the line averages that out.
+fn fit(robot: Robot, slot: i32, tick: i32) -> Fit fails CoreError {
+    let none = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+    let history = robot.tracker.history(slot)?;
+    var best = 1000000.0;
+    for s in history {
+        if s.tick > tick - WINDOW && s.bearing_error < best { best = s.bearing_error; }
+    }
+    var n: i32 = 0;
+    var t_sum = 0.0;
+    var x_sum = 0.0;
+    var y_sum = 0.0;
+    var z_sum = 0.0;
+    for s in history {
+        if s.tick > tick - WINDOW && s.bearing_error <= 1.5 * best {
+            n = n + 1;
+            t_sum = t_sum + (s.tick as f64);
+            x_sum = x_sum + s.position.x;
+            y_sum = y_sum + s.position.y;
+            z_sum = z_sum + s.position.z;
+        }
+    }
+    if n < 2 { return Fit { position: none, velocity: none, count: 0 }; }
+    let t0 = t_sum / (n as f64);
+    let mx = x_sum / (n as f64);
+    let my = y_sum / (n as f64);
+    let mz = z_sum / (n as f64);
+    var spread = 0.0;
+    var sx = 0.0;
+    var sy = 0.0;
+    var sz = 0.0;
+    for s in history {
+        if s.tick > tick - WINDOW && s.bearing_error <= 1.5 * best {
+            let dt = (s.tick as f64) - t0;
+            spread = spread + dt * dt;
+            sx = sx + dt * (s.position.x - mx);
+            sy = sy + dt * (s.position.y - my);
+            sz = sz + dt * (s.position.z - mz);
+        }
+    }
+    let ahead = (tick as f64) - t0;
+    let rate = robot.match_info.tick_rate()? as f64;
+    let kx = sx / spread;
+    let ky = sy / spread;
+    let kz = sz / spread;
+    Fit {
+        position: Vec3 { x: mx + kx * ahead, y: my + ky * ahead, z: mz + kz * ahead },
+        velocity: Vec3 { x: kx * rate, y: ky * rate, z: kz * rate },
+        count: n,
+    }
+}
 fn steer(robot: Robot, towards: f64, current: f64, scale: f64 = 45.0) -> f64 fails CoreError {
     robot.angles.clamp(robot.angles.angle_diff(towards, current)? / scale)?
 }
@@ -61,26 +127,61 @@ impl Strategy for Starter {
         let heading = robot.me.heading()?;
         let pitch = robot.me.pitch()?;
         let tick = robot.clock.tick()?;
+        let scanned = robot.scanner.last()?;
         robot.drive.forces(brake: .Some(0.2))?;
+        // The last target, if it was seen within REACQUIRE ticks.
+        var lost: Option<Vec3> = .None;
+        if self.slot != 0 {
+            if let .Some(at) = robot.tracker.last_seen(self.slot)? {
+                if tick - at <= REACQUIRE { lost = robot.tracker.position(self.slot)?; }
+            }
+        }
         match robot.sensors.nearest()? {
             .Some(target) => {
                 let throttle = if target.range > 350.0 { 0.7 } else if target.range < 200.0 { -0.4 } else { 0.2 };
+                self.slot = target.slot;
                 robot.drive.set(.Some(throttle), .Some(steer(robot, target.bearing, heading)?), .Some(steer(robot, target.elevation, pitch)?))?;
-                robot.scanner.set(.Some(target.bearing), .Some(20.0), .Some(target.elevation))?;
+                // Halve the beam each tick until it is HOLD_WIDTH across at the target:
+                // narrow enough for a precise bearing, wide enough to keep it in.
+                let hold = math.max(MIN_ARC, 2.0 * math.atan2(HOLD_WIDTH / 2.0, target.range) * 180.0 / math.pi());
+                // In a crowd a narrow beam sees one robot: every LOOK_EVERY ticks, widen it for a tick.
+                let halved = math.min(SEARCH_ARC, scanned.arc / 2.0);
+                let arc = if tick % LOOK_EVERY == 0 { SEARCH_ARC } else { math.max(hold, halved) };
+                robot.scanner.set(.Some(target.bearing), .Some(arc), .Some(target.elevation))?;
                 let power = robot.gun.power_for_flight_time(target.range, 1.0)?;
-                // The lead is the intercept if the target holds its course.
-                let aim = match robot.gun.lead(target, power)? {
+                // An exact contact: the lead is the intercept if the target holds its
+                // course. A noisy one: lead the fitted line, and fire only once it
+                // rests on enough sightings.
+                var ready = true;
+                var led: Option<clunkyard.Solution> = .None;
+                if target.bearing_error > 0.0 {
+                    let line = fit(robot, target.slot, tick)?;
+                    if line.count >= 2 { led = robot.gun.lead_point(line.position, line.velocity, power)?; }
+                    ready = line.count >= SIGHTINGS;
+                } else {
+                    led = robot.gun.lead(target, power)?;
+                }
+                let aim = match led {
                     .Some(aim) => Direction { heading: aim.heading, pitch: aim.pitch },
                     .None => Direction { heading: target.bearing, pitch: target.elevation },
                 };
                 robot.gun.aim(.Some(aim.heading), .Some(aim.pitch))?;
                 let now = robot.gun.aim_now()?;
-                if math.abs(robot.angles.angle_diff(aim.heading, now.heading)?) < 3.0 && math.abs(aim.pitch - now.pitch) < 3.0 && robot.gun.can_fire(power, 10.0)? {
+                if ready && math.abs(robot.angles.angle_diff(aim.heading, now.heading)?) < 3.0 && math.abs(aim.pitch - now.pitch) < 3.0 && robot.gun.can_fire(power, 10.0)? {
                     robot.gun.fire(.Some(power))?;
                 }
-                robot.status.set(.Some("TRACK"), .Some(target.range))?;
+                robot.status.set(.Some(if ready { "TRACK" } else { "NARROW" }), .Some(target.range))?;
             }
-            .None => match robot.tracker.cue()? {
+            .None => match lost {
+                .Some(spot) => {
+                    // Lost it: look again where it was last seen, widening the beam, before searching.
+                    let bearing = robot.angles.bearing_to(position, spot)?;
+                    let elevation = if self.free_flight { robot.angles.elevation_to(position, spot)? } else { 0.0 };
+                    robot.drive.set(.Some(0.5), .Some(steer(robot, bearing, heading)?), .Some(steer(robot, elevation, pitch)?))?;
+                    robot.scanner.set(.Some(bearing), .Some(math.min(SEARCH_ARC, scanned.arc * 2.0)), .Some(elevation))?;
+                    robot.status.set(.Some("REACQUIRE"))?;
+                }
+                .None => match robot.tracker.cue()? {
                 .Some(cue) => {
                     let bearing = robot.angles.bearing_to(position, cue.position)?;
                     let distance = robot.angles.distance(position, cue.position)?;
@@ -93,11 +194,11 @@ impl Strategy for Starter {
                     robot.status.set(.Some("CUE"), .Some(distance))?;
                 }
                 .None => {
-                    let scan = robot.scanner.last()?;
                     robot.drive.set(.Some(0.5), .Some(0.33), .Some(steer(robot, 0.0, pitch)?))?;
                     let elevation = if self.free_flight { (((tick / 10) % 3 - 1) as f64) * 35.0 } else { 0.0 };
-                    robot.scanner.set(.Some(robot.angles.normalize(scan.heading + 36.0)?), .Some(40.0), .Some(elevation))?;
+                    robot.scanner.set(.Some(robot.angles.normalize(scanned.heading + 36.0)?), .Some(40.0), .Some(elevation))?;
                     robot.status.set(.Some("SEARCH"))?;
+                }
                 }
             }
         }
@@ -139,4 +240,4 @@ impl Strategy for Starter {
         }
     }
 }
-fn main() { let _ = clunkyard.run(Starter { free_flight: false, dodge_until: 0, dodges: 0 }); }
+fn main() { let _ = clunkyard.run(Starter { free_flight: false, dodge_until: 0, dodges: 0, slot: 0 }); }
